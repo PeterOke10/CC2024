@@ -1,0 +1,887 @@
+layout (local_size_x = 8, local_size_y = 8) in;
+#include "perlin3DSlope"
+
+// uniforms
+// system setup
+uniform int uReset;
+uniform int uPlay;
+uniform float uFpsTick;
+uniform float uTime;
+uniform float uSpeed;
+uniform int uBirthTrigger;
+uniform int uTextureDepth;
+
+uniform int uBirthMode;
+uniform int uParticles;
+uniform float uBirthRate;
+uniform vec2 uParticleLifeType;
+uniform vec4 uParticleLife;
+uniform float uDrag;
+uniform float uVelocityMax;
+uniform vec2 uVelocityRemap;
+uniform vec3 uSize;
+
+// external input options (like a optical flow)
+uniform vec3 uInput;
+
+// life options
+#define LIFE_CONSTANT 0
+#define LIFE_RANDOM 1
+#define LIFE_EFFECTOR_R 2
+#define LIFE_EFFECTOR_G 3
+#define LIFE_EFFECTOR_B 4
+#define LIFE_EFFECTOR_A 5
+
+// life modifier
+#define LIFE_MOD_NONE 0
+#define LIFE_MOD_EFFECTOR_R 1
+#define LIFE_MOD_EFFECTOR_G 2
+#define LIFE_MOD_EFFECTOR_B 3
+#define LIFE_MOD_EFFECTOR_A 4
+
+// force options
+#define CONSTANT 0
+#define AGE 1
+#define VELOCITY 2
+#define EFFECTOR_R 3
+#define EFFECTOR_G 4
+#define EFFECTOR_B 5
+#define EFFECTOR_A 6
+
+// forces
+uniform samplerBuffer uExternalPars;
+uniform samplerBuffer uWindPars;
+uniform samplerBuffer uTurbPars;
+
+// directional forces
+uniform samplerBuffer uForcePosition;
+uniform samplerBuffer uForceAmount;
+uniform samplerBuffer uForceDirection;
+
+// bounds
+uniform float uAvoidFactor;
+uniform vec3 uLimitPos;
+uniform vec3 uLimitNeg;
+uniform int uHit;
+	// hit behaviour
+	#define HIT_NONE 0
+	#define HIT_DIE 1
+	#define HIT_BOUNCE 2
+	#define HIT_AVOID 3
+	#define HIT_STICK 4
+	#define HIT_FADE 5
+
+// color
+uniform int uColorType;
+uniform vec2 uFadeTime;
+uniform vec4 uColor1;
+uniform vec4 uColor2;
+	// color modes
+	#define COLOR_SOLID 0
+	#define COLOR_RANDOM 1
+	#define COLOR_SOURCE 2
+	#define COLOR_VELOCITY 3
+	#define COLOR_TURB 4
+	#define COLOR_AGE_L 5
+	#define COLOR_VELOCITY_L 6
+	#define COLOR_EFFECTOR_R 7
+	#define COLOR_EFFECTOR_G 8
+	#define COLOR_EFFECTOR_B 9
+	#define COLOR_EFFECTOR_A 10
+
+// rotation
+uniform int uRotationType;
+uniform vec4 uRotationInit;
+uniform vec3 uRotationSpeed;
+
+	// rotation types
+	#define ROTATION_NONE 0
+	#define ROTATION_VELOCITY 1
+	#define ROTATION_BILLBOARD 2
+	#define ROTATION_CONTINOUS 3
+
+// camera matrix
+uniform mat4 uTransMat;
+
+// partice states
+#define PARTICLE_STATE_DEAD 0
+#define PARTICLE_STATE_DYING 1
+#define PARTICLE_STATE_ALIVE 2
+#define PARTICLE_STATE_STICK 3
+
+// size options
+#define SIZE_CONSTANT 0
+#define SIZE_RANDOM 1
+#define SIZE_AGE 2
+#define SIZE_VELOCITY 3
+#define SIZE_EFFECTOR_R 4
+#define SIZE_EFFECTOR_G 5
+#define SIZE_EFFECTOR_B 6
+#define SIZE_EFFECTOR_A 7
+
+// inputs
+#define TEX_START_POS 0
+#define TEX_START_VELOCITY 1
+#define TEX_START_COLOR 2
+#define TEX_OPTICAL_FLOW 3
+#define TEX_EFFECTOR 4
+#define TEX_SIZE_LOOKUP 5
+#define TEX_TURB_LOOKUP 6
+#define TEX_WIND_LOOKUP 7
+#define TEX_EXTERNAL_LOOKUP 8
+#define TEX_COLOR_LOOKUP 9
+
+// buffers
+#define PARTICLE_POS 0
+#define PARTICLE_LIFE 1
+#define PARTICLE_VELOCITY 2
+#define PARTICLE_ROTATEVECTOR 3
+#define PARTICLE_INIT_COLOR 4
+#define PARTICLE_COLOR 5
+#define PARTICLE_SIZE 6
+#define PARTICLE_ROTATION 7
+
+// birth modes
+#define BIRTH_TOTALNUM 0
+#define BIRTH_PERFRAME 1
+
+// other things
+#define PI 3.1415926536
+
+//#################################//
+
+struct Particle 
+{
+	int index;
+	int id;
+	float lifetime;
+	float maxLife;
+	int state;
+	vec3 position;
+	vec3 velocity;
+	vec3 force;
+	float speed;
+	vec3 rotateToVector;
+	vec4 initColor;
+	vec4 color;
+	vec3 turbulence;
+	float size;
+	float sizeType;
+	vec3 rotation;
+
+};
+
+uint gParticles;
+Particle gParticle;
+
+// set up an atomic counter to control birthrate
+layout(binding = 0, offset = 0) uniform atomic_uint birthCount;
+
+// ############## Helper Functions ##############//
+float Hash(vec2 p) { return fract(mod(sin(dot(p,vec2(12.9898,78.233))) * 43758.5453, PI)); }
+
+ivec2 Index2XY(int index)
+{
+	return ivec2(index % int(uTDOutputInfo.res.z), floor(index / uTDOutputInfo.res.z));
+}
+
+vec4 Tex(int type, ivec2 uv)
+{
+	return texelFetch(sTD2DInputs[type], uv, 0);
+}
+
+float Lifetime() { return gParticle.lifetime / gParticle.maxLife; }
+
+float Velocity() { 
+	float velocity = length(gParticle.velocity);
+	return (velocity - uVelocityRemap.x) / (uVelocityRemap.y - uVelocityRemap.x);
+}
+
+mat4 rotation3d(vec3 axis, float angle) {
+  //axis = normalize(axis);
+  float s = sin(angle);
+  float c = cos(angle);
+  float oc = 1.0 - c;
+
+  return mat4(
+		oc * axis.x * axis.x + c,           oc * axis.x * axis.y - axis.z * s,  oc * axis.z * axis.x + axis.y * s,  0.0,
+		oc * axis.x * axis.y + axis.z * s,  oc * axis.y * axis.y + c,           oc * axis.y * axis.z - axis.x * s,  0.0,
+		oc * axis.z * axis.x - axis.y * s,  oc * axis.y * axis.z + axis.x * s,  oc * axis.z * axis.z + c,           0.0,
+		0.0,                                0.0,                                0.0,                                1.0
+	);
+}
+
+float reMap(in float value, in float low1, in float high1, in float low2, in float high2){
+	return float(low2 + (value - low1) * (high2 - low2) / (high1 - low1));
+}
+
+// ################# Main Functions ##################//
+void Read(int index)
+{
+	
+	ivec2 texPos = Index2XY(index);
+	vec4 position = imageLoad(mTDComputeOutputs[PARTICLE_POS], texPos);
+	vec4 life = imageLoad(mTDComputeOutputs[PARTICLE_LIFE], texPos);
+	vec4 velocity = imageLoad(mTDComputeOutputs[PARTICLE_VELOCITY], texPos);
+	vec4 rotateToVector = imageLoad(mTDComputeOutputs[PARTICLE_ROTATEVECTOR], texPos);
+	vec4 initColor = imageLoad(mTDComputeOutputs[PARTICLE_INIT_COLOR], texPos);
+	vec4 size = imageLoad(mTDComputeOutputs[PARTICLE_SIZE], texPos);
+	vec4 rotation = imageLoad(mTDComputeOutputs[PARTICLE_ROTATION], texPos);
+	// build particle struct
+	gParticle.index = index;
+	gParticle.id = int(size.w);
+	gParticle.lifetime = life.x;
+	gParticle.maxLife = life.y;
+	gParticle.state = int(life.z);
+	gParticle.position = position.xyz;
+	gParticle.velocity = velocity.xyz;
+	gParticle.force = vec3(0.0);
+	gParticle.speed = velocity.w;
+	gParticle.rotateToVector = rotateToVector.xyz;
+	gParticle.size = size.x;
+	gParticle.sizeType = size.z;
+	gParticle.initColor = initColor;
+	gParticle.rotation = rotation.xyz;
+
+}
+
+void Rotation()
+{
+	vec3 rotateToVector = gParticle.rotateToVector;
+	vec3 rotation = gParticle.rotation;
+	if (uRotationType == ROTATION_NONE)
+	{
+		rotateToVector = vec3(0.0,0.0,1.0);
+		rotation = vec3(0.0);
+	}
+	if (uRotationType == ROTATION_VELOCITY)
+	{
+		rotation += abs(gParticle.velocity);
+		//rotation /= length(rotation);
+		//rotation *= 360;
+	}
+	else if (uRotationType == ROTATION_BILLBOARD)
+	{
+		// billboard
+		mat4 invTM = uTransMat;
+		mat4 unit = mat4(1.0, 0.0, 0.0, gParticle.position.x, 
+						0.0, 1.0, 0.0, gParticle.position.y, 
+						0.0, 0.0, 1.0, gParticle.position.z, 
+						0.0, 0.0, 0.0, 1.0);
+		unit[0][0] = 1.0;
+		unit[0][1] = 0.0;
+		unit[0][2] = 0.0;
+
+		unit[1][0] = 0.0;
+		unit[1][1] = 1.0;
+		unit[1][2] = 0.0;
+		
+		unit[2][0] = 0.0;
+		unit[2][1] = 0.0;
+		unit[2][2] = 1.0;
+
+		rotateToVector = ((invTM * unit) * vec4(0, 0, 1, 1)).xyz;
+		rotateToVector /= length(rotateToVector);
+		rotation.xy = vec2(0);
+		rotation.z += uRotationSpeed.z*uSpeed*uFpsTick;
+	}
+	else if (uRotationType == ROTATION_CONTINOUS)
+	{
+		rotateToVector = (rotation3d(uRotationSpeed, uSpeed*uFpsTick) * vec4(rotateToVector, 1)).xyz;
+		rotation += uRotationSpeed*uSpeed*uFpsTick;
+	}
+	gParticle.rotateToVector = rotateToVector.xyz;
+	gParticle.rotation = rotation;
+}
+
+void Color()
+{
+	vec4 color = gParticle.initColor;
+	ivec2 texPos = Index2XY(gParticle.index);
+	if (uColorType == COLOR_VELOCITY)
+	{
+		color.rgb = vec3(abs(gParticle.velocity));
+		color.a = length(color.rgb);
+	}
+	else if (uColorType == COLOR_TURB)
+	{
+		color.rgb = vec3(abs(gParticle.turbulence));
+		color.a = length(color.rgb);
+	}
+	else if (uColorType > COLOR_TURB)
+	{
+		float effector;
+		if (uColorType == COLOR_AGE_L)
+		{
+			effector = Lifetime();
+		}
+		else if (uColorType == COLOR_VELOCITY_L)
+		{
+			effector = Velocity();
+		}
+		else if (uColorType >= COLOR_EFFECTOR_R && uColorType <= COLOR_EFFECTOR_A)
+		{
+			effector = Tex(TEX_EFFECTOR, texPos)[int(uColorType - COLOR_EFFECTOR_R)];
+		}
+		color = texture(sTD2DInputs[TEX_COLOR_LOOKUP], vec2(effector,0.5)).rgba;
+	}
+
+	float spentLife = gParticle.maxLife - gParticle.lifetime;
+	float fadeIn = smoothstep(0, uFadeTime.x, spentLife);
+	float fadeOut = smoothstep(gParticle.maxLife-uFadeTime.y, gParticle.maxLife, spentLife);
+	color.a *= fadeIn * (1 - fadeOut);
+
+	color.rgb *= color.a;
+	gParticle.color = color;
+}
+
+void Spawn()
+{
+	ivec2 texPos = Index2XY(gParticle.index);
+	vec2 xy = vec2(gParticle.index, uTime);
+	gParticle.id = int(mix(0, uTextureDepth, Hash(xy+0.2)));
+
+	if (uParticleLifeType.r == LIFE_CONSTANT)
+	{
+		gParticle.maxLife = mix(uParticleLife.x, uParticleLife.y, Hash(xy+0.5));
+	}
+	else if (uParticleLifeType.r == LIFE_RANDOM)
+	{
+		gParticle.maxLife = mix(uParticleLife.x, uParticleLife.z, Hash(xy+0.5));
+	}
+	else if (uParticleLifeType.r >= LIFE_EFFECTOR_R && uParticleLifeType.r <= LIFE_EFFECTOR_A)
+	{
+			float effector = Tex(TEX_EFFECTOR, texPos)[int(uParticleLifeType.r - LIFE_EFFECTOR_R)];
+			gParticle.maxLife = mix(uParticleLife.x, uParticleLife.z, effector);
+	} 
+	gParticle.lifetime = gParticle.maxLife;
+	gParticle.state = PARTICLE_STATE_ALIVE;
+	// get starting velocity
+	{
+		vec4 force = Tex(TEX_START_VELOCITY, texPos);
+		gParticle.velocity = force.xyz;
+	}
+	// get color
+	vec4 color = uColor1;
+	if (uColorType == COLOR_RANDOM)
+	{
+		color = mix(uColor1, uColor2, Hash(xy+0.5));
+	}
+	else if (uColorType == COLOR_SOURCE)
+	{
+		color = Tex(TEX_START_COLOR, texPos);
+	}
+	gParticle.initColor = color;
+	gParticle.color = color;
+	Color();
+
+	// size
+	gParticle.sizeType = uSize.z;
+	if (gParticle.sizeType == SIZE_CONSTANT)
+	{
+		gParticle.size = uSize.x;
+	}
+	else if (gParticle.sizeType == SIZE_RANDOM)
+	{
+		gParticle.size = mix(uSize.x, uSize.y, Hash(xy+0.5));
+	}
+	else if (gParticle.sizeType == SIZE_AGE)
+	{
+		gParticle.size = texture(sTD2DInputs[TEX_SIZE_LOOKUP], vec2(0,0.5)).r;
+	}
+	else if (gParticle.sizeType == SIZE_VELOCITY)
+	{
+		gParticle.size = texture(sTD2DInputs[TEX_SIZE_LOOKUP], vec2(Velocity(),0.5)).r;
+	}
+
+	gParticles += 1;
+
+	// get starting position
+	{
+		vec4 data = Tex(TEX_START_POS, texPos);
+		gParticle.position = data.xyz;
+	}
+
+	// get starting rotation
+	if (uRotationType == ROTATION_CONTINOUS)
+	{
+		vec3 rotateToVector = vec3(0.0, 0.0, 1.0);
+		vec3 rotation = vec3(0.0);
+		if (uRotationInit.xyz != vec3(0.0))
+		{
+			rotateToVector = uRotationInit.xyz;
+		}
+		if (uRotationInit.w > 0.5)
+		{
+			rotation = vec3(Hash(xy+0.123)*360,Hash(xy+0.326)*360,Hash(xy+0.732)*360);
+
+		}
+		gParticle.rotateToVector = rotateToVector;
+		gParticle.rotation = rotation;
+	}
+	Rotation();
+}
+
+void Death()
+{
+	// set the particle state and reduce particle count
+	gParticle.state = PARTICLE_STATE_DEAD;
+	gParticle.position = vec3(0.0);
+	gParticle.velocity = vec3(0.0);
+	gParticle.force = vec3(0.0);
+	gParticles -= 1;
+}
+
+
+void Size()
+{
+	if (gParticle.sizeType != SIZE_CONSTANT && gParticle.sizeType != SIZE_RANDOM)
+	{
+		float effector = 0.0;
+		if (gParticle.sizeType == SIZE_AGE)
+		{	
+			effector = 1-Lifetime();
+		}
+		else if (gParticle.sizeType == SIZE_VELOCITY)
+		{
+			effector = Velocity();
+		}
+		else if (gParticle.sizeType >= SIZE_EFFECTOR_R && gParticle.sizeType <= SIZE_EFFECTOR_A)
+		{
+			ivec2 texPos = Index2XY(gParticle.index);
+			effector = Tex(TEX_EFFECTOR, texPos)[int(gParticle.sizeType - SIZE_EFFECTOR_R)];
+		}
+		gParticle.size = texture(sTD2DInputs[TEX_SIZE_LOOKUP], vec2(effector,0.5)).r;
+	}
+}
+
+void Bounds()
+{
+	bvec3 limitPos = greaterThanEqual(gParticle.position, uLimitPos);
+	bvec3 limitNeg = lessThanEqual(gParticle.position, uLimitNeg);
+
+	vec3 reflectNormal = -vec3(limitPos) + vec3(limitNeg);
+	float inBound = dot(vec3(limitPos), vec3(1.0)) + dot(vec3(limitNeg), vec3(1.0));
+
+	vec3 limitPosDistance = gParticle.position - uLimitPos;
+	vec3 limitNegDistance = gParticle.position - uLimitNeg;
+
+	limitPosDistance *= vec3(limitPos);
+	limitNegDistance *= vec3(limitNeg);
+
+	vec3 force = -limitPosDistance - limitNegDistance;
+
+	if (any(limitPos) || any(limitNeg))
+	{ 
+		if (uHit == HIT_DIE)
+		{
+			Death();
+		}
+		else if (uHit == HIT_BOUNCE)
+		{
+			gParticle.velocity = (-2.0 * dot(gParticle.velocity, reflectNormal) * reflectNormal + gParticle.velocity);
+		}
+		else if (uHit == HIT_AVOID)
+		{
+			// apply avoid factor
+			force /= inBound;
+			force *= uAvoidFactor;
+			gParticle.velocity += force;
+		}
+		else if (uHit == HIT_STICK)
+		{
+			gParticle.velocity = vec3(0.0);
+		}
+		else if (uHit == HIT_FADE)
+		{
+			gParticle.lifetime = min(uFadeTime.y, gParticle.lifetime);
+		}
+	}
+}
+
+// for force lookups return the right lookup value
+float Effector(int type)
+{
+	float effector = 1.0;
+	if (type == AGE){
+		effector = 1 - Lifetime();
+	}
+	else if (type == VELOCITY){
+		effector = Velocity();
+	}
+	else if (type >= EFFECTOR_R && type <= EFFECTOR_A)
+	{
+		ivec2 texPos = Index2XY(gParticle.index);
+		effector = Tex(TEX_EFFECTOR, texPos)[int(type - EFFECTOR_R)];
+	}
+	return effector;
+}
+
+void External()
+{
+
+	float externalMagnitude = texelFetch(uExternalPars, 1).r;
+	int externalType = int(texelFetch(uExternalPars, 2).r);
+	float externalVariance = texelFetch(uExternalPars, 3).r;
+	vec3 externalAmplitude = vec3(texelFetch(uExternalPars, 4).r,
+								  texelFetch(uExternalPars, 5).r, 
+								  texelFetch(uExternalPars, 6).r);
+	float effector = Effector(externalType);
+
+	if (externalType > CONSTANT)
+	{
+		externalAmplitude = texture(sTD2DInputs[TEX_EXTERNAL_LOOKUP], vec2(effector, 0.3)).rgb;
+		vec2 externalMV = texture(sTD2DInputs[TEX_EXTERNAL_LOOKUP], vec2(effector, 0.6)).rg;
+		externalMagnitude = externalMV.r;
+		externalVariance = externalMV.g;
+	}
+
+	// external is a constant force added to the velocity - think gravity
+	vec3 lookup = gParticle.position;
+	lookup.z += uTime*0.1;
+	vec3 variance = SimplexPerlin3D_Deriv(lookup, 4.723).yzw;
+	vec3 force = externalAmplitude * externalMagnitude;
+	force += (variance * force * externalVariance);
+	gParticle.force += force;
+}
+
+// apply external input (like optical flow)
+void ExternalInput()
+{
+	vec3 lookup = gParticle.position;
+	lookup.z += uTime*0.1;
+
+	vec2 fieldSize = vec2(2.0*uInput.y,2.0*uInput.z);
+	vec2 currPos = lookup.xy;
+	vec2 texPosReMap = vec2(0.0);
+	texPosReMap.x = reMap(currPos.x,-fieldSize.x,fieldSize.x,0,1);
+	texPosReMap.y = reMap(currPos.y,-fieldSize.y,fieldSize.y,0,1);
+
+	vec3 force = vec3(0.0);
+	force.xy = texture(sTD2DInputs[TEX_OPTICAL_FLOW], texPosReMap).xy * -uInput.x;
+	force /= uFpsTick;
+	gParticle.force += force;
+}
+
+void Wind()
+{
+	float windMagnitude = texelFetch(uWindPars, 1).r;
+	int windType = int(texelFetch(uWindPars, 2));
+	float windVariance = texelFetch(uWindPars, 3).r;
+	vec3 windAmplitude = vec3(texelFetch(uWindPars, 4).r, 
+							  texelFetch(uWindPars, 5).r,
+							  texelFetch(uWindPars, 6).r);
+	float effector = Effector(windType);
+
+	if (windType > CONSTANT)
+	{
+		windAmplitude = texture(sTD2DInputs[TEX_WIND_LOOKUP], vec2(effector, 0.3)).rgb;
+		vec2 windMV = texture(sTD2DInputs[TEX_WIND_LOOKUP], vec2(effector, 0.6)).rg;
+		windMagnitude = windMV.r;
+		windVariance = windMV.g;
+	}
+
+	// wind is a force that is being added until max velocity has been reached
+	vec3 lookup = gParticle.position;
+	lookup.z += uTime*0.1;
+	vec3 variance = SimplexPerlin3D_Deriv(lookup, 9.021).yzw;
+	vec3 force = windAmplitude.xyz * windMagnitude;
+	force += (variance * force * windVariance);
+
+	// check if velocity and wind are pointing into the same direction
+	bvec3 forceDir = greaterThan(gParticle.velocity * force, vec3(0.0));
+	// limit force if they are
+	bvec3 forceLimit = lessThan(abs(gParticle.velocity)*vec3(forceDir),abs(force));
+	force *= vec3(forceLimit);
+
+	gParticle.force += force;
+}
+
+void Turbulence()
+{
+
+	float turbMagnitude = texelFetch(uTurbPars, 1).r;
+	vec3 turbPeriod = vec3(texelFetch(uTurbPars, 2).r);
+	float turbSeed = texelFetch(uTurbPars, 3).r;
+	vec3 turbTransform = vec3(texelFetch(uTurbPars, 4).r, 
+							  texelFetch(uTurbPars, 5).r, 
+							  texelFetch(uTurbPars, 6).r);
+	int turbType = int(texelFetch(uTurbPars, 7).r);
+	vec3 turbAmplitude = vec3(texelFetch(uTurbPars, 8).r, 
+							  texelFetch(uTurbPars, 9).r, 
+							  texelFetch(uTurbPars, 10).r);
+
+	float effector = Effector(turbType);
+
+	if (turbType > CONSTANT)
+	{
+		turbTransform = texture(sTD2DInputs[TEX_TURB_LOOKUP], vec2(effector, 0.75)).rgb;
+		vec3 turbMps = texture(sTD2DInputs[TEX_TURB_LOOKUP], vec2(effector, 0.5)).rgb;
+		turbMagnitude = turbMps.r;
+		turbPeriod = vec3(turbMps.g);
+		turbSeed = turbMps.b;
+		turbAmplitude = texture(sTD2DInputs[TEX_TURB_LOOKUP], vec2(effector, 0.25)).rgb;
+	}
+
+	vec3 lookup = gParticle.position;
+	lookup *= vec3(1.0) / turbPeriod;
+	lookup += turbTransform;
+
+	vec3 force = SimplexPerlin3D_Deriv(lookup, turbSeed).yzw;
+	force *= turbAmplitude * turbMagnitude;
+	gParticle.turbulence = force;
+	gParticle.force += force;
+}
+
+float Density(vec3 dir, float forceRadius)
+{
+	float density;
+	density = length(dir) / forceRadius;
+	if (density > 1.0){
+		return 0.0;
+	}
+	if (density < 0.0){
+		return 1.0;
+	}
+	// wyvill 
+	density = ((((-4.0/9.0)*density + (17.0/9.0))*density + (-22.0/9.0))*density) + 1.0;
+	return 1.0 - density;
+}
+
+void Radial(vec4 forcePosSize, float forceAmount)
+{
+	vec3 center = forcePosSize.xyz;
+	vec3 pos = gParticle.position;
+	vec3 dir = pos - center;
+	float density = Density(dir, forcePosSize.w);
+	dir = normalize(dir);
+	gParticle.force -= forceAmount * density * dir;
+}
+
+void Axial(vec4 forcePosSize, float forceAmount, vec3 axis)
+{
+	if (axis == vec3(0.0))
+	{
+		axis = vec3(0.0, 0.0, 1.0);
+	}
+	vec3 center = forcePosSize.xyz;
+	vec3 pos = gParticle.position;
+	vec3 dir = pos - center;
+	float density = Density(dir, forcePosSize.w);
+	dir = normalize(dir);
+	//axis = normalize(axis + center);
+
+	gParticle.force += forceAmount * density * axis;
+}
+
+void Vortex(vec4 forcePosSize, float forceAmount, vec3 axis)
+{
+	if (axis == vec3(0.0))
+	{
+		axis = vec3(0.0, 0.0, 1.0);
+	}
+	vec3 center = forcePosSize.xyz;
+	vec3 pos = gParticle.position;
+	vec3 dir = pos - center;
+	float density = Density(dir, forcePosSize.w);
+	dir = normalize(dir);
+	//axis = normalize(axis + center);
+
+	float aDotD = dot(axis, dir);
+	dir -= aDotD * axis;
+	dir = normalize(dir);
+	axis = cross(axis,dir);
+	gParticle.force += forceAmount * density * axis;
+}
+
+void Spiral(vec4 forcePosSize, float forceAmount, vec3 axis)
+{
+	if (axis == vec3(0.0))
+	{
+		axis = vec3(0.0, 0.0, 1.0);
+	}
+	vec3 center = forcePosSize.xyz;
+	vec3 pos = gParticle.position;
+	vec3 dir = pos - center;
+	float density = Density(dir, forcePosSize.w);
+	dir = normalize(dir);
+	//axis = normalize(axis + center);
+
+	float aDotD = dot(axis, dir);
+	dir -= aDotD * axis;
+	dir = normalize(dir);
+	gParticle.force -= forceAmount * density * dir;
+}
+
+void ExtraForce()
+{
+	// get length of input texture buffer
+	// workaround for not adjusting samplerBuffer size
+	//int numForces = textureSize(uForcePosition);
+	int numForces = int(texelFetch(uForceAmount, 0).b);
+
+	for (int i = 0; i < numForces; i++)
+	{
+
+		vec4 forcePosSize = texelFetch(uForcePosition, i);
+		vec2 forceAmountType = texelFetch(uForceAmount, i).rg;
+		vec3 forceDirection = texelFetch(uForceDirection, i).rgb;
+
+		if (forceAmountType.g == 0 && forceAmountType.r != 0.0){
+			Radial(forcePosSize, forceAmountType.r);
+		}
+		else if (forceAmountType.g == 1 && forceAmountType.r != 0.0){
+			Axial(forcePosSize, forceAmountType.r, forceDirection);
+		}
+		else if (forceAmountType.g == 2 && forceAmountType.r != 0.0){
+			Vortex(forcePosSize, forceAmountType.r, forceDirection);
+		}
+		else if (forceAmountType.g == 3 && forceAmountType.r != 0.0){
+			Spiral(forcePosSize, forceAmountType.r, forceDirection);
+		}
+
+	}
+}
+
+void Drag()
+{
+	gParticle.velocity += -(uDrag) * uFpsTick * uSpeed * gParticle.velocity;
+}
+
+// update loop
+void Update()
+{
+
+	if (gParticle.state == PARTICLE_STATE_ALIVE)
+	{
+		// add up all the forces
+		External();
+		Wind();
+		Turbulence();
+		ExtraForce();
+		ExternalInput();
+
+		#include "custom"
+
+		gParticle.force *= uFpsTick * uSpeed;
+		gParticle.velocity.xyz += gParticle.force;
+
+		// limit velocity
+		if (length(gParticle.velocity) > uVelocityMax)
+		{
+			gParticle.velocity = normalize(gParticle.velocity) * uVelocityMax;
+		}
+
+		Bounds();
+		Drag();
+		Size();
+
+		// update position
+		gParticle.position += gParticle.velocity * (uFpsTick * uSpeed);
+
+		// apply life modifier
+		ivec2 texPos = Index2XY(gParticle.index);
+		if (uParticleLifeType.g >= LIFE_MOD_EFFECTOR_R && uParticleLifeType.g <= LIFE_MOD_EFFECTOR_A)
+		{
+			float effector = Tex(TEX_EFFECTOR, texPos)[int(uParticleLifeType.g - LIFE_MOD_EFFECTOR_R)];
+			gParticle.lifetime *= effector;
+		}
+		gParticle.lifetime -= (uFpsTick * uSpeed);
+
+		if (gParticle.lifetime < 0)
+		{
+			gParticle.state = PARTICLE_STATE_DYING;
+		}
+
+	}
+
+	if (gParticle.state == PARTICLE_STATE_DYING)
+	{
+		Death();
+		return;
+	}
+	else if (gParticle.state == PARTICLE_STATE_DEAD)
+	{
+		int legalBirth = 1;
+		if (uBirthMode == BIRTH_PERFRAME)
+		{
+			if (atomicCounterIncrement(birthCount) >= uBirthRate * max(uSpeed, 1.0))
+			{
+				legalBirth = 0;
+			}
+		}
+		if (uBirthTrigger != 1)
+		{
+			legalBirth = 0;
+		}
+		if (legalBirth > 0)
+		{
+			Spawn();
+		}
+	}
+
+	// calculate Color
+	Color();
+	// calculate rotation
+	Rotation();
+}
+
+void Write()
+{
+	ivec2 texPos = Index2XY(gParticle.index);
+	// write position
+	imageStore(mTDComputeOutputs[PARTICLE_POS], texPos, vec4(gParticle.position, gParticle.state));
+	// write life
+	float lifeNorm = 1 - (gParticle.lifetime / gParticle.maxLife); 
+	imageStore(mTDComputeOutputs[PARTICLE_LIFE], texPos, vec4(gParticle.lifetime, gParticle.maxLife, gParticle.state, 0.0));
+	// write velocity
+	imageStore(mTDComputeOutputs[PARTICLE_VELOCITY], texPos, vec4(gParticle.velocity, length(gParticle.velocity)));
+	// write rotate to vector
+	imageStore(mTDComputeOutputs[PARTICLE_ROTATEVECTOR], texPos, vec4(gParticle.rotateToVector, length(gParticle.rotateToVector)));
+	//write initial color
+	imageStore(mTDComputeOutputs[PARTICLE_INIT_COLOR], texPos, gParticle.initColor);
+	//write color
+	imageStore(mTDComputeOutputs[PARTICLE_COLOR], texPos, gParticle.color);
+	//write size, index and id
+	imageStore(mTDComputeOutputs[PARTICLE_SIZE], texPos, vec4(gParticle.size, gParticle.index, gParticle.sizeType, gParticle.id));
+	//write rotation
+	imageStore(mTDComputeOutputs[PARTICLE_ROTATION], texPos, vec4(gParticle.rotation, gParticle.id));
+
+}
+
+void main()
+{
+	int index = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x);
+
+	if (uReset > 0)
+	{
+		ivec2 texPos = Index2XY(index);
+		imageStore(mTDComputeOutputs[0], texPos, vec4(0));	
+		imageStore(mTDComputeOutputs[1], texPos, vec4(0));	
+		imageStore(mTDComputeOutputs[2], texPos, vec4(0));
+		imageStore(mTDComputeOutputs[3], texPos, vec4(0));
+		imageStore(mTDComputeOutputs[4], texPos, vec4(0));
+		imageStore(mTDComputeOutputs[5], texPos, vec4(0));
+		imageStore(mTDComputeOutputs[6], texPos, vec4(0));
+	}
+	else if (uPlay == 1)
+	{
+		int maxParticles = uParticles;
+		if (uBirthMode == BIRTH_PERFRAME)
+		{
+			maxParticles = int(pow(uTDOutputInfo.res.z,2));
+		}
+		if (index < maxParticles)
+		{
+			Read(index);
+			Update();
+			Write();
+		}
+		else
+		{
+			Read(index);
+			Death();
+			Write();
+		}
+	}
+}
