@@ -1,0 +1,111 @@
+/* This file is for the 3rd assignment at course Experience & Interface. 
+ * It uses Arduino to read the sensors and send the numbers to TouchDesigner through Serial portal, 
+   then it receives the numbers from TouchDesigner and change the LEDs based on them. 
+ */
+
+#include <HCSR04.h>   // include distance sensor library
+#include <FastLED.h>  // include LED stripe library
+
+
+UltraSonicDistanceSensor dSensor2(4, 5);  // Initialize sensor: painting
+
+// ------ settings
+// input pins
+// analog pins are used to provide the flexibility to switch to different sensors while testing and developing the story
+int sensors[] = { A7, A4, A6, A5 };  // order: baby shoes(tilt switch), volleyball(vibrate sensor), phone's receiver(the original switch in the phone), chair(pressure sensor)
+int senorNo = 4;
+
+// output pins
+// int LEDs[] = { 12, 11, 10 };  // for testing; order: 1st object, 2nd object, 3rd object
+// int LEDsNo = 4; // for testing
+// bool switches[] = { 0, 0, 0 };
+
+// output: about LED
+
+// define numbers
+#define NUM_STRIPS 4
+#define NUM_LEDS_PER_STRIP 24
+
+// Define the array of leds
+CRGB lights[NUM_STRIPS][NUM_LEDS_PER_STRIP];
+// LED colors
+int outColour[][3] = {
+  { 250, 150, 150 },  // baby shoes: pink
+  { 25, 170, 255 },   // volleyball: golden light
+  { 5, 250, 200 },    // painting: angry red
+  { 160, 150, 50 },   // chair: sad blue
+  { 180, 255, 120 }   // painting2: regret purplu blue
+};
+
+// ------ variables for data exchange
+int output;
+int input;
+
+
+
+void setup() {
+  // start serial port at 9600 bps:
+  Serial.begin(9600);
+
+  // set up input pins mode
+  for (int i = 0; i < senorNo; i++) {
+    pinMode(sensors[i], INPUT);
+  }
+
+  // set up LED stripes
+  FastLED.addLeds<WS2812B, 12, GRB>(lights[0], NUM_LEDS_PER_STRIP);
+  FastLED.addLeds<WS2812B, 11, GRB>(lights[1], NUM_LEDS_PER_STRIP);
+  FastLED.addLeds<WS2812B, 10, GRB>(lights[2], NUM_LEDS_PER_STRIP);
+  FastLED.addLeds<WS2812B, 9, GRB>(lights[3], NUM_LEDS_PER_STRIP);
+}
+
+
+void loop() {
+
+  // read and send out data
+  for (int i = 0; i < senorNo; i++) {
+    output = analogRead(sensors[i]);  // read the number
+    Serial.print(output);             // set through serial port
+    Serial.print(',');                // use , to separate the data, so they can be transferred to table DAT in TouchDesigner
+  }
+  Serial.print(dSensor2.measureDistanceCm());  // distance sensor
+
+  Serial.print('\n');  // use \n to separate each message
+
+
+  // receive data and change the light
+  if (Serial.available() > 0) {
+    input = Serial.readStringUntil('\n').toInt();  // read input
+
+    // based on the number to turn on one stripe and turn off others
+
+    if (input == 4) {  // this number means the second chance -> turn on the 3rd stripe with different colour
+      for (int j = 0; j < NUM_LEDS_PER_STRIP; j++) {
+        if (j % 2 == 0) { // alter the colours to make a soft mood, otherwise it will be too neon style
+          .lights[2][j].setHSV(outColour[input][0], outColour[input][1], outColour[input][2]);
+        } else {
+          lights[2][j].setHSV(outColour[input][0] + 10, outColour[input][1] - 30, outColour[input][2] - 50);
+        }
+        FastLED.show();
+      }
+    } else { // for other situation, turn on the stripe with the same index
+      for (int i = 0; i < NUM_STRIPS; i++) {
+        if (i == input) {
+          for (int j = 0; j < NUM_LEDS_PER_STRIP; j++) {
+            if (j % 2 == 0) {
+              lights[i][j].setHSV(outColour[input][0], outColour[input][1], outColour[input][2]);
+            } else {
+              lights[i][j].setHSV(outColour[input][0] + 10, outColour[input][1] - 30, outColour[input][2] * 0.75);
+            }
+          }
+        } else { // turn off other stripe
+          for (int j = 0; j < NUM_LEDS_PER_STRIP; j++) {
+            lights[i][j].setHSV(0, 0, 0);
+          }
+        }
+      }
+    }
+  }
+
+  FastLED.show();
+}
